@@ -80,7 +80,7 @@ python main.py -u jsmith@contoso.com -f ./config.env
 python main.py -u jsmith@contoso.com -f ./config.env -delete
 ```
 ## Output
-Duplicates are logged per folder to ./output/<user>-<folder>.csv The CSV contains the Received timestamp, Subject, and Body of the message.
+Duplicates are logged per folder to ./output/user-folder.csv The CSV contains the Received timestamp, Subject, and Body of the message.
 
 ## Notes/Tips
   - Delete is set to false by default, and the -delete flag must be added to perform deletion of items from the mail server.
@@ -88,4 +88,5 @@ Duplicates are logged per folder to ./output/<user>-<folder>.csv The CSV contain
   - The oldest message per hash is kept and the newer duplicates are deleted.
   - It is possible for very technically different emails to be deleted such as automated reminders from a reminder - we hash links within these messages to try and combat false positives but if an automated message is sending you the same link then technically newer emails are still going to be deleted erroneously.
   - This should work on large mail boxes with tens of thousands of messages.
+  - You must be a delegated user on any mail box that you're attempting to run this script on.
 
