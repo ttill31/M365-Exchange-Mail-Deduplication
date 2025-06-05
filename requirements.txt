@@ -1,0 +1,4 @@
+msal==1.26.0
+python-dotenv==1.1.0
+Requests==2.32.3
+rich==14.0.0
