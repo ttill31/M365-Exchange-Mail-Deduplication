@@ -2,7 +2,7 @@ from hashlib import sha256
 from re import sub, findall, IGNORECASE
 from os import mkdir, getenv
 from os.path import isdir, join, exists
-from argparse import ArgumentParser, ArgumentError, ArgumentTypeError, Namespace
+from argparse import ArgumentParser, ArgumentError, Namespace
 from time import sleep
 from datetime import datetime
 from csv import DictWriter
@@ -24,6 +24,9 @@ BATCH_REQUEST_URL: str = r'https://graph.microsoft.com/v1.0/$batch'
 # Our Rich Text styles
 STYLES: dict[str, str] = {'success': 'green', 'caution': 'yellow', 'error': 'red', 'info': 'cyan'}
 
+# Our session token
+AZURE_AUTH_TOKEN: str = ''
+
 def main() -> None:
     """Main entry point of the program that handles over-arching logic.
     """
@@ -34,8 +37,8 @@ def main() -> None:
         tenant_id, client_id = get_env_data(args['file'], console)
 
         if tenant_id and client_id:
-            azure_auth_token: str = get_delegated_token(tenant_id, client_id, console)
-            scan_and_optionally_delete(azure_auth_token, args['user'], console, args['delete'])
+            set_delegated_token(console)
+            scan_and_optionally_delete(args['user'], console, bool(args['delete']))
         else:
             console.print(f'Error reading in environment variables. Please ensure you have values set for "AZURE_TENANT_ID" and "DEDUPE_CLIENT_ID"', style='error')
 
@@ -177,21 +180,26 @@ def compute_hash(subject: str, body: str) -> str:
     return sha256(f'{clean_subject}|{clean_body}|{link_text}'.encode('utf-8')).hexdigest()
 
 # MSAL: Get delegated access token
-def get_delegated_token(tenant_id: str, client_id: str, console: Console) -> str:
-    """Retrieves an access token that allows a user to perform actions on mail boxes in a M365 tenant.
+def set_delegated_token(console: Console) -> bool:
+    """Retrieves an access token that allows a user to perform actions on mail boxes in a M365 tenant. Sets global AZURE_AUTH_TOKEN
 
     Args:
-        tenant_id (str): The ID of the M365 tenant we're trying to access.
-        client_id (str): The client ID of the application that will grant us permissions to access mail boxes.
         console (Console): Rich-text console for pretty print statements.
 
     Raises:
         Exception: Generic error if an access token was unable to be acquired.
 
     Returns:
-        str: The access token that grants permission for all mailbox related actions.
+        bool: Returns true if the operation was successful, false if it wasn't
     """
     console.print(r'Acquiring authorization to perform mailbox actions. You should see a browser window open and ask you to login.', style='info')
+
+    tenant_id: str | None = getenv('AZURE_TENANT_ID') or None
+    client_id: str | None = getenv('DEDUPE_CLIENT_ID') or None
+
+    if not (tenant_id and client_id):
+        console.print('Unable to retrieve Tenant ID or Client ID from env file.', style='error')
+        return False
 
     scopes: list[str] = ['Mail.ReadWrite', 'Mail.ReadWrite.Shared']
     authority_url: str = f'https://login.microsoftonline.com/{tenant_id}'
@@ -199,17 +207,21 @@ def get_delegated_token(tenant_id: str, client_id: str, console: Console) -> str
     result: dict[str, Any] | dict[str, str] | dict | Any | dict[Any | str, Any] = app.acquire_token_interactive(scopes=scopes)
 
     if 'access_token' in result:
+        global AZURE_AUTH_TOKEN
         console.print('Token successfully acquired!\n', style='success')
-        return result['access_token']
+        AZURE_AUTH_TOKEN = result['access_token']
+        return True
     else:
-        raise Exception('Authentication failed.')
+        console.print('Authorization failed.', style='Error')
+        return False
 
-def soft_graph_call(url: str, headers: dict[str, str], max_tries: int = 5, json_payload: dict[str, Any] = None) -> Response:
+def soft_graph_call(url: str, headers: dict[str, str], console: Console, max_tries: int = 15, json_payload: dict[str, Any] | None = None) -> tuple[Response, bool]:
     """Attempts to gracefully reach out to an endpoint and handle various status codes.
 
     Args:
         url (str): The target endpoint.
         headers (dict[str, str]): The payload headers that should be used.
+        console (Console): Rich-text console for pretty print statements.
         max_tries (int, optional): The maximum number of retries before giving up if something goes wrong. Defaults to 5.
         json_payload (dict[str, Any], optional): Optional data that can be sent along to the endpoint. Defaults to None.
 
@@ -217,9 +229,10 @@ def soft_graph_call(url: str, headers: dict[str, str], max_tries: int = 5, json_
         Exception: Raises generic exception if a non-200 status is received to the point max retries has been exhausted.
 
     Returns:
-        Response: Returns a Response object from the requests module if successful.
+        tuple[Response, bool]: Returns a tuple that has a Response object containing the information from the request and a bool that informs whether the token had to be refreshed
     """
     try_count: int = 0
+    token_refresh: bool = False
 
     while try_count < max_tries:
         response: Response = get(url=url, headers=headers,timeout=(10,60)) if json_payload is None else post(
@@ -227,7 +240,13 @@ def soft_graph_call(url: str, headers: dict[str, str], max_tries: int = 5, json_
 
         match(response.status_code):
             case 200: # Everything is okay
-                return response
+                return (response, token_refresh)
+            
+            case 401: # Our auth token expired
+                console.print('Bad authentication, re-attempting authorization')
+                if set_delegated_token(console):
+                    headers = create_headers(AZURE_AUTH_TOKEN, json_payload is None)
+                    token_refresh = True
             
             case 429: # We're getting throttled
                 wait_for: int = int(response.headers.get('Retry-After', '5'))
@@ -238,31 +257,35 @@ def soft_graph_call(url: str, headers: dict[str, str], max_tries: int = 5, json_
                 sleep(wait_for)
 
             case _:
-                print(f'Unhandled error {response.status_code} during graph call to {url}')
+                console.print(f'Unhandled error {response.status_code} during graph call to {url}', style='error')
 
         try_count += 1
 
     raise Exception(f'Microsoft graph call failed after {max_tries} tries.')
 
-def get_mail_folders(token: str, target_user: str) -> list[MailFolder]:
+def get_mail_folders(target_user: str, console: Console) -> list[MailFolder]:
     """Retrieves the target user's mail folders.
 
     Args:
-        token (str): M365 Authorization token.
         target_user (str): Target user whose mailbox is being scanned.
+        console (Console): Rich-text console for pretty print statements.
 
     Returns:
         list[MailFolder]: A list of the user's mail folders from their mailbox.
     """
-    headers: dict[str, str] = create_headers(token) 
+    headers: dict[str, str] = create_headers(AZURE_AUTH_TOKEN) 
 
     url: str | None = GET_MAILBOX_FOLDERS_URL.replace(r'{{user_id}}', target_user)
 
     all_folders: list[MailFolder] = list()
 
     while url:
-        response: Response = soft_graph_call(url, headers)
+        response, token_refresh = soft_graph_call(url=url, headers=headers, console=console)
         response.raise_for_status()
+
+        if token_refresh:
+            headers = create_headers(AZURE_AUTH_TOKEN)
+
         data: dict[str, Any] = response.json()
         url: str | None = data.get('@odata.nextLink', None)
         parsed_data: list[MailFolder] = [MailFolder(d['id'], d['displayName'], d['totalItemCount']) for d in data['value']]
@@ -270,53 +293,56 @@ def get_mail_folders(token: str, target_user: str) -> list[MailFolder]:
 
     return all_folders
 
-def fetch_messages(token: str, target_user: str, target_folder: str) -> Generator[MailMessage, None, None]:
+def fetch_messages(target_user: str, target_folder: str, console: Console) -> Generator[MailMessage, None, None]:
     """Fetches mail messages from a specified folder from the target user.
 
     Args:
-        token (str): M365 Authorization token.
         target_user (str): Target user whose mailbox is being scanned.
         target_folder (str): Target mail folder that should be scanned.
+        console (Console): Rich-text console for pretty print statements.
 
     Yields:
         Generator[MailMessage, None, None]: A single mail message at a time for processing.
     """
-    headers: dict[str, str] = create_headers(token)
+    headers: dict[str, str] = create_headers(AZURE_AUTH_TOKEN)
 
-    url: str = GET_FOLDER_MESSAGE_URL.replace(r'{{user_id}}', target_user).replace(r'{{folder_id}}', target_folder)
+    url: str | None = GET_FOLDER_MESSAGE_URL.replace(r'{{user_id}}', target_user).replace(r'{{folder_id}}', target_folder)
 
     while url:
-        response: Response = soft_graph_call(url, headers)
+        response, token_refresh = soft_graph_call(url=url, headers=headers, console=console)
         response.raise_for_status()
+
+        if token_refresh:
+            headers = create_headers(AZURE_AUTH_TOKEN)
+
         data: dict[str, str] | dict[str, list[Any]] = response.json()
         message_batch: list[dict[str, Any]] = data.get('value', [])
         url = data.get('@odata.nextLink', None)
 
         for message in message_batch:
             yield MailMessage(
-                id=message.get('id'),
+                id=message.get('id', ''),
                 subject=message.get('subject', ''),
                 body=message.get('body', {}).get('content', ''),
                 received=message.get('receivedDateTime', '')
             )
 
-def scan_and_optionally_delete(token: str, user: str, console: Console, should_delete: bool=False):
+def scan_and_optionally_delete(user: str, console: Console, should_delete: bool=False):
     """Scans through all of the mail folders of a user in search of duplicate emails. Duplicates are recorded and output to CSVs. Optionally, the emails can be deleted from the mail server.
 
     Args:
-        token (str): M365 Authorization token.
         user (str): Target user whose mailbox is being scanned.
         console (Console): Rich-text console for pretty print statements.
         should_delete (bool, optional): Flag for deleting the emails on the mail server or not. Defaults to False.
     """
-    folders: list[MailFolder] = get_mail_folders(token, user)
+    folders: list[MailFolder] = get_mail_folders(user, console)
 
     for folder in track(folders, description='Mailbox folder progress...'):
         if folder.total_count > 0:
             console.print(f'Scanning {folder.display_name}...', style='info')
             hash_map: dict[str, list[MailMessage]] = dict()
 
-            for message in fetch_messages(token, user, folder.id):
+            for message in fetch_messages(user, folder.id, console):
                 message_hash: str = compute_hash(message.subject, message.body)
 
                 if message_hash not in hash_map:
@@ -344,11 +370,11 @@ def scan_and_optionally_delete(token: str, user: str, console: Console, should_d
 
                 if should_delete:
                     console.print('Deleting emails.', style='caution')
-                    delete_messages_batched(token, duplicates, user, folder.id, console)
+                    delete_messages_batched(duplicates, user, folder.id, console)
         else:
             console.print(f'\nSkipping {folder.display_name} since it has 0 items.', style='caution')    
 
-def sanitize_file_name(file_name: str, invalid_chars: set[str, str] = {'\\', '/', '\'', ','} ) -> str:
+def sanitize_file_name(file_name: str, invalid_chars: set[str] = {'\\', '/', '\'', ','} ) -> str:
     """Removes illegal characters from file names that might prevent issues when attempting to output to a file.
 
     Args:
@@ -381,18 +407,17 @@ def write_dupes_to_csv(file: str, duplicates: list[MailMessage]) -> None:
         writer.writeheader()
         writer.writerows([{'Received': dupe.received, 'Subject': dupe.subject, 'Body': dupe.body} for dupe in duplicates])
 
-def delete_messages_batched(token: str, message_ids: list[MailMessage], user_id: str, folder_id: str, console: Console, batch_size: int = 20) -> None:
+def delete_messages_batched(message_ids: list[MailMessage], user_id: str, folder_id: str, console: Console, batch_size: int = 20) -> None:
     """Deletes emails from the inbox in batches.
 
     Args:
-        token (str): M365 Authorization token.
         message_ids (list[MailMessage]): List of messages to delete.
         user_id (str): Target user whose mailbox is being scanned.
         folder_id (str): The folder containing the messages we're about to delete.
         console (Console): Rich-text console for pretty print statements.
         batch_size (int, optional): How many emails we want to delete in a single batch. Each email in the batch is considered an API call. Defaults to 20 which is Microsoft's current batch limit.
     """
-    headers: dict[str, str] = create_headers(token, True)
+    headers: dict[str, str] = create_headers(AZURE_AUTH_TOKEN, True)
 
     # Split into batches of batch_size (at the time of this script, Microsoft limits this to a maximum of 20)
     for i in range(0, len(message_ids), batch_size):
@@ -407,11 +432,15 @@ def delete_messages_batched(token: str, message_ids: list[MailMessage], user_id:
 
         batch_payload = { 'requests': requests }
 
-        response: Response = soft_graph_call(
+        response, token_refresh = soft_graph_call(
             BATCH_REQUEST_URL,
             headers=headers,
-            json_payload=batch_payload
+            json_payload=batch_payload,
+            console=console
         )
+
+        if token_refresh:
+            headers = create_headers(AZURE_AUTH_TOKEN, True)
 
         result: list[dict[str, Any]] = response.json()
         for item in result.get('responses', []):
